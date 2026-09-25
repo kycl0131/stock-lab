@@ -370,8 +370,10 @@ class LiveConfigTests(unittest.TestCase):
 
     def test_template_names_codex_cli_without_price_fields_or_defaults(self):
         proposer = auto.template()["proposer"]
+        pin = {"<symbol>": {"path": None, "sha256": None}}
         self.assertEqual(proposer, {"kind": "MODEL | BASELINE", "provider": "codex_cli", "model": None,
-                                    "max_calls_per_day": None, "timeout_seconds": None})
+                                    "max_calls_per_day": None, "timeout_seconds": None,
+                                    "forecast": {"artifacts": {"KR": pin, "US": pin}, "max_artifact_age_days": None}})
         with self.assertRaises(ValidationError):
             auto.validate_config(auto.template())
 
@@ -423,34 +425,30 @@ class LiveCycleTests(OfflineCase):
         self.assertEqual(self.cycle(fake)["skipped"], "NO_CONFIG")
         self.assertEqual(fake.calls, [])
 
-    def test_dry_run_records_subscription_decision_at_zero_cost(self):
+    def test_model_without_forecast_config_holds_without_codex_call(self):
+        # The subscription-audit path with a pinned forecast is covered in test_ts_forecast.LiveForecastCycleTests.
         self.save(model_config())
-        hold_text = proposal_text(action="HOLD", symbol="", evidence_ids=[])
-        fake = FakeRun(exec_result=run_result(0, events(hold_text)), output=hold_text)
+        fake = FakeRun()
         result = self.cycle(fake)
         self.assertEqual(result["status"], "COMPLETED", result)
-        self.assertIsNone(result["outcome"]["model_error"])
-        self.assertEqual(len(fake.exec_calls), 1)
+        self.assertEqual(result["outcome"]["proposal"]["action"], "HOLD")
+        self.assertEqual(result["outcome"]["model_error"], "FORECAST:FORECAST_NOT_CONFIGURED")
+        self.assertEqual(fake.calls, [], "no login check and no codex exec without a forecast")
         row = self.conn.execute("SELECT * FROM auto_decisions").fetchone()
         self.assertEqual((row["proposer"], row["model_cost_krw"]), ("MODEL", "0"))
-        meta = json.loads(row["model_meta_json"])
-        self.assertEqual((meta["provider"], meta["billing"], meta["usage"], meta["called"]),
-                         ("codex_cli", "chatgpt_subscription", USAGE, True))
-        for secret in SECRETS.values():
-            self.assertNotIn(secret, row["model_meta_json"])
-        summary = auto.status(self.conn)["decisions"][0]
-        self.assertEqual((summary["model_provider"], summary["model"], summary["model_usage"],
-                          summary["model_cost_krw"]), ("codex_cli", MODEL, USAGE, "0"))
+        self.assertIs(json.loads(row["model_meta_json"])["called"], False)
         for table in ("tickets", "auto_intents", "submission_claims"):
             self.assertEqual(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0, table)
 
-    def test_live_cycle_model_failure_is_hold_without_order(self):
+    def test_live_cycle_without_forecast_is_hold_without_order(self):
         self.save(model_config())
         self.arm()
-        result = self.cycle(FakeRun(login=run_result(0, b"", b"Logged in using an API key - sk-***")), mode="LIVE")
+        fake = FakeRun(login=run_result(0, b"", b"Logged in using an API key - sk-***"))
+        result = self.cycle(fake, mode="LIVE")
         self.assertEqual(result["status"], "COMPLETED", result)
         self.assertEqual(result["outcome"]["proposal"]["action"], "HOLD")
-        self.assertIn("API key", result["outcome"]["model_error"])
+        self.assertTrue(result["outcome"]["model_error"].startswith("FORECAST:"))
+        self.assertEqual(fake.calls, [])
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM tickets").fetchone()[0], 0)
 
     def test_stale_openai_config_fails_closed_and_new_config_invalidates_arm(self):

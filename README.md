@@ -139,7 +139,7 @@
 - `capital_cap_krw`: 총 자본 상한(원). 이 프로그램이 보유한 수량의 원화 매입가 합과 미종결 BUY 예약액의 합이 넘을 수 없습니다. **계좌 현금을 전부 쓰지 않습니다.**
 - 시장별 `universe`(최대 8종목, KR `KRX`, US `ND/NY/NA`), `max_order_krw`, `max_position_krw`, `max_daily_loss_krw`, `max_orders_per_day`, `costs`(수수료·매도세·슬리피지, US는 환전 bps), 장 시작 후·마감 전 여유(분, KR 마감 전 ≥ 15분), `calendar`.
 - `calendar`: KRX·NYSE/Nasdaq 공식 공지에서 옮겨 적은 거래일·정규장 시각(최대 200일, 출처 필수). 유효 기간 안에 없는 날은 휴장이고, 기간 밖이면 주문하지 않습니다. 요일 규칙으로 추정하지 않습니다. 미국 시각은 법정 서머타임 규칙(3월 둘째 일요일~11월 첫째 일요일, 2007~2030년만 허용)으로 변환하고, 시스템 시간대 DB가 있으면 둘이 일치해야 합니다.
-- `max_total_loss_krw`, `cycle`(간격 ≥ 120초, 분봉 수, 분봉·호가 최대 나이, 가격 칼라·최대 스프레드 bps), `proposer`(`MODEL`: `provider`는 `codex_cli`만 허용·정확한 모델 ID(기본값 없음)·`max_calls_per_day`(1~200)·`timeout_seconds`(30~600), 또는 `BASELINE`), `baseline` 임계값, `arm_max_hours`(≤ 168). 이전 `openai`(API 키) 설정, `anthropic` 제공자, `claude*` 모델, `max_output_tokens`·토큰 단가 필드는 거부됩니다. 이전 `openai` 설정이 최신으로 저장되어 있으면 `auto run-once`/`watch`/`status`가 설정 오류로 멈추므로(주문 없음) `auto template`으로 새 설정을 저장하세요. 새 설정은 해시가 달라 기존 arm을 무효로 만듭니다.
+- `max_total_loss_krw`, `cycle`(간격 ≥ 120초, 분봉 수 5~31, 분봉·호가 최대 나이, 가격 칼라·최대 스프레드 bps), `proposer`(`MODEL`: `provider`는 `codex_cli`만 허용·정확한 모델 ID(기본값 없음)·`max_calls_per_day`(1~200)·`timeout_seconds`(30~600)·시계열 산출물 고정 `forecast`(없으면 매 주기 HOLD, 아래 참조), 또는 `BASELINE`), `baseline` 임계값, `arm_max_hours`(≤ 168). 이전 `openai`(API 키) 설정, `anthropic` 제공자, `claude*` 모델, `max_output_tokens`·토큰 단가 필드는 거부됩니다. 이전 `openai` 설정이 최신으로 저장되어 있으면 `auto run-once`/`watch`/`status`가 설정 오류로 멈추므로(주문 없음) `auto template`으로 새 설정을 저장하세요. 새 설정은 해시가 달라 기존 arm을 무효로 만듭니다.
 
 **LIVE 모델 제안자 (`MODEL`)**: [live_ai.py](stocklab/live_ai.py)가 설치된 Codex CLI(`codex exec`)를 사용자의 **ChatGPT 로그인(구독)** 으로 한 번 실행합니다. OpenAI API 키·API 과금 경로는 없고, API·다른 제공자·다른 모델로의 대체나 재시도도 없습니다.
 - 로그인 확인: 매 호출 전 `codex login status`가 `Logged in using ChatGPT`여야 합니다. API 키 로그인, 미로그인, 확인 시간 초과(20초)는 호출하지 않고 HOLD입니다. 로그인 정보는 읽거나 바꾸지 않습니다.
@@ -148,6 +148,7 @@
 - 실패 시 HOLD(재시도 없음): CLI 없음, 로그인 실패, 사용량·속도 제한, 시간 초과, 0이 아닌 종료 코드, stdout 1 MB/stderr 64 KB/최종 출력 8 KB 초과, JSONL 이벤트 형식 오류, 도구 활동(명령 실행·파일 변경·MCP·웹 검색 등; 이벤트가 보이는 즉시 프로세스 트리를 종료), 메시지·턴이 정확히 1개가 아님, 출력 파일 없음·이벤트와 불일치·잘못된 JSON·중복 키, `validate_proposal` 실패. CLI의 stderr·원문 출력은 저장·출력하지 않고 고정된 오류 분류만 남깁니다. Windows에서는 창 없이 실행하고 시간 초과 시 `taskkill /T`로 하위 프로세스까지 종료합니다.
 - 비용 기록: 구독 호출은 `model_cost_krw`를 0원으로 기록합니다. 이는 호출당 청구가 없다는 뜻일 뿐 무료라는 뜻이 아니며, 구독 사용량 한도가 소진되면 HOLD가 됩니다. 이전 API 호출 행의 비용은 그대로 합산됩니다. `--dry-run`도 `MODEL`이면 실제로 Codex를 실행해 구독 사용량을 씁니다.
 - 기록: `model_meta_json`에 제공자(`codex_cli`), 과금 방식(`chatgpt_subscription`), 모델 ID(CLI에 지정한 값), 스레드 ID, CLI가 보고한 사용량(input/cached_input/output/reasoning_output 토큰), 프롬프트·스냅샷 해시, 오류 분류를 남기고 `auto status`에 표시합니다. 모델 출력은 제안일 뿐이며 수량·가격은 위험 엔진이 정합니다.
+- **시계열 예측 → Codex 2단계**: `MODEL` 주기는 Codex 호출 전에 같은 시세 전용 스냅샷으로 [ts_forecast.py](stocklab/ts_forecast.py)의 ARX/ridge 예측(향후 30분 총수익 bp)을 계산합니다. `proposer.forecast`에 활성 시장의 **모든 설정 종목**마다 학습 산출물의 절대 경로와 파일 SHA-256을 고정하고 `max_artifact_age_days`(1~90, 기본값 없음)를 적으며, `cycle.lookback_bars`는 31이어야 합니다(허용 범위 5~31). `forecast` 블록이 없거나, 산출물이 없거나·해시/스키마/종목 불일치·학습 마지막 세션이 오늘 이후이거나 기한 초과·연속 1분봉 31개 부족/끊김/오래됨·설정 밖 보유 종목(고정 산출물 없음)이면 **Codex를 부르지 않고 HOLD**합니다(`called=false`, 호출 상한에 미포함). Codex는 검증된 스냅샷과 좁은 예측 객체(모델 버전, 종목, 예측 총수익 bp, 학습 잔차 표준편차, 학습 세션·행 수, 가정 왕복 비용 bp = 현재 호가 스프레드 + 설정 비용, 예측 순수익 bp)만 표준 입력으로 받습니다. 계좌·현금·키·학습 날짜·미래 값은 들어가지 않습니다. Codex가 최종 제안자이며, 이후 결정적 게이트가 예측 순수익 ≤ 0인 BUY와 예측 총수익 ≥ 0인 SELL을 HOLD로 바꿉니다(원래 제안은 `model_proposal`, 결과는 `forecast_gate`로 기록). 손실 기준·한도·위험 엔진은 그대로 별도로 적용됩니다. `BASELINE` 제안자는 영향을 받지 않습니다. 자동 설정·arm은 여전히 없으며 사용자가 한도·캘린더 등을 직접 채워야 합니다.
 
 **arm (`auto arm`)**: 확인 문구 `ARM REAL AUTO <설정 해시 12자> <N>H`를 대화형 터미널에서 입력합니다. arm은 최신 설정과 시장별 최신 `live cap`에 묶이고 N시간 뒤 만료됩니다. 활성 시장에 `live cap`이 없으면 arm 하지 않습니다. 다음 경우 권한이 즉시 사라집니다: 새 설정, 새 `live cap`, `auto disarm`, 만료, `live halt --market ALL`, 손실 트리거, 결과불명 주문, 종결 오류. 같은 검사가 Python과 SQLite 트리거(주문 의도 생성·`ATTEMPTED` 전환) 양쪽에 있고, 전송 직전 `submit`에서 한 번 더 확인합니다. 재시작한 프로세스도 기존 arm이 여전히 유효할 때만 이어서 동작하며 스스로 다시 arm 하지 않습니다.
 
@@ -166,7 +167,7 @@
 6. 위험 엔진이 주문을 최대 1건 만듭니다. BUY는 최우선 매도호가, SELL은 최우선 매수호가로 냅니다. 스프레드와 최근 체결가 대비 거리가 칼라 안이어야 합니다. BUY 수량은 설정 주문 한도, `live cap` 주문당·잔여 누적 한도, 총 자본 상한 잔여, 종목 한도, 주문가능현금 × 현금 비율 중 최솟값을 비용 버퍼를 포함한 1주 가격으로 나눈 값입니다. US는 환율로 환산하고, 계좌 환율과 시세 환율이 3% 넘게 다르면 거부합니다. SELL은 이 프로그램이 산 확인 수량 전부입니다. 한 종목에는 한 번에 한 포지션만 둡니다.
 7. LIVE: 호가를 새로 조회해 다시 계산합니다. 티켓과 주문 의도를 한 트랜잭션에 만들고, `live send`와 같은 경로(증권사 재조회, 게이트, `ATTEMPTED`, 1회 전송 권한 `submission_claims`)로 정확히 1회 전송합니다. 접수가 아니면(UNKNOWN) disarm하고 재전송하지 않습니다. 예상하지 못한 오류는 해당 시장을 영구 halt하고 disarm합니다.
 
-**아직 없는 것·미검증**: 취소·정정 주문, 부분체결 잔량의 자동 종결, 웹소켓 실시간 시세, 공식 장 운영 상태(VI·거래정지) API, 실제 수수료·세금 확인, 성과 평가·보고, 저장된 스냅샷의 일괄 재생·평가 도구, 연구 후보의 과거·전향 성과 검증. 부분체결이나 장 마감 후 남은 주문은 사람이 앱에서 확인하고 `live close`로 종결할 때까지 그 시장을 막습니다. 미확인 잔량이 있는 주문을 사람 종결하면 해당 시장 자동매매가 중단되고 다른 시장 신규 매수도 차단됩니다. 자동 복구 절차는 없습니다. `auto status`의 `unverified` 목록에 있는 필드는 실제 응답으로 확인되지 않았습니다. 로컬 PC 시계가 틀리면 신선도 검사 때문에 모두 관망합니다.
+**아직 없는 것·미검증**: 취소·정정 주문, 부분체결 잔량의 자동 종결, 웹소켓 실시간 시세, 공식 장 운영 상태(VI·거래정지) API, 실제 수수료·세금 확인, 실전 성과 평가·보고, 저장된 스냅샷의 일괄 재생·평가 도구, 뉴스·공시 시각 검증 수집기, 연구 후보의 과거·전향 성과 검증. 부분체결이나 장 마감 후 남은 주문은 사람이 앱에서 확인하고 `live close`로 종결할 때까지 그 시장을 막습니다. 미확인 잔량이 있는 주문을 사람 종결하면 해당 시장 자동매매가 중단되고 다른 시장 신규 매수도 차단됩니다. 자동 복구 절차는 없습니다. `auto status`의 `unverified` 목록에 있는 필드는 실제 응답으로 확인되지 않았습니다. 로컬 PC 시계가 틀리면 신선도 검사 때문에 모두 관망합니다.
 
 **실사용 전 필요한 단계**: `auto status`의 `steps_before_live`를 참고하세요. 요약하면: 한도(`live cap`) → 설정 작성·저장 → `--dry-run` 관찰 → 실제 응답 형식 확인과 소액 수동 주문·대사 확인(KR·US 각각) → `auto arm` → `auto watch`.
 
@@ -298,6 +299,26 @@ python -m stocklab.historical_eval --input bars.csv --output report.json --buy-f
 - 비용 가정(bp): 호가는 t봉 종가 중심의 **고정 가정 스프레드**(기본 왕복 10bp, 편도 절반)입니다. KR 매수·매도 수수료 1.5, 매도세 20, 슬리피지 편도 10, 환전 0 / US 수수료 25, 매도세 0, 슬리피지 편도 10, 환전 편도 10. `--buy-fee-bps`, `--sell-fee-bps`, `--sell-tax-bps`, `--slippage-bps`, `--fx-cost-bps`로 확인한 요율을 입력할 수 있습니다. **기본값은 예시이며 실제 수수료율이나 과거 호가를 확인한 값이 아닙니다.**
 - 보고서(JSON): 행·세션·적격 구간 수, BUY/HOLD, 거래 수, 총/순 수익 거래 수와 비율, 평균·중앙 순수익(bp), 1단위 순차 복리 수익률과 최대낙폭, 모델 버전과 모든 가정. 거래 0건이면 승률은 `null`(0%가 아님). 거래 30건 미만 또는 거래가 있는 세션 20개 미만이면 `minimum_historical_sample_gate_passed=false`입니다. 이 최소 표본 조건을 통과해도 미래 정확도가 입증되는 것은 아니므로 `future_accuracy_validated`는 항상 `false`입니다.
 - **자동매매 엔진의 정확한 재현이 아닙니다.** 매도 경로, 주문·리스크·수량·포트폴리오 시뮬레이션이 없고, 가정된 체결 결과는 미래 성과의 근거가 아닙니다.
+
+## 시계열 모델 학습과 과거 2단계(시계열 + Codex) 검증 (주문 없음)
+
+위 `historical_eval`의 두 규칙은 학습된 모델이 아닌 고정 규칙입니다. 아래는 **종목별로 학습하는** 선형 시계열 모델과 그 예측을 Codex에 넘기는 2단계 경로입니다. 같은 CSV 형식·검증(`historical_eval.load_bars`)을 씁니다. 학습 산출물과 보고서는 Git에서 제외된 `artifacts/`(또는 `data/`, 저장소 밖)에만 쓸 수 있습니다.
+
+```powershell
+python -m stocklab.ts_forecast train --input bars.csv --output artifacts\ts-005930-v1.json --train-end-session 2026-09-18
+python -m stocklab.hybrid_eval --input bars.csv --output artifacts\hybrid-005930.json                     # 예측만, Codex 호출 없음
+python -m stocklab.hybrid_eval --input bars.csv --output artifacts\hybrid-005930.json --model <정확한 Codex 모델 ID> --max-codex-calls 20
+```
+
+- 모델 `stocklab-ts-arx-ridge-v1`: t봉 종가 시점에 같은 세션의 연속 1분봉 31개(t-30..t)만 사용합니다. 특징은 1/5/10/30분 로그수익률(bp), 30분 실현변동성, 최근 5분/31분 평균 거래량 비의 로그입니다. 목표는 (t+30 종가 / t 종가 - 1) × 10000(비용 전)이며 t..t+30이 같은 세션에서 끊김 없이 이어질 때만 학습 행이 됩니다. 빠진·중복 분봉이나 세션 경계가 들어간 구간은 버립니다.
+- 학습: `--train-end-session`(필수, 기본값 없음) 이하 세션만으로 표준화 평균·표준편차와 ridge 계수를 적합합니다. 규제 강도(행 수 × 0.1)와 적격 기준(학습 세션 5개·행 500개 이상)은 코드에 미리 고정되어 있고 홀드아웃으로 고르지 않습니다. 이후 세션은 진단(MAE·RMSE·방향 적중률)으로만 출력합니다. 학습 행은 1분 간격으로 겹치므로 서로 강하게 상관되어 있고, 잔차 표준편차는 표본 내 진단일 뿐 보정된 불확실성이 아닙니다.
+- 산출물: 시장·종목·출처, 특징·목표·창 크기, 학습 세션 범위·행 수, 입력 파일 SHA-256과 학습 분봉 해시, 평균·표준편차·계수·절편, 잔차 진단, 자기 내용 해시를 담은 JSON입니다. 같은 경로에 덮어쓰지 않습니다. 명령이 출력하는 `artifact_sha256`(파일 바이트 해시)를 `auto` 설정의 `proposer.forecast.artifacts.<시장>.<종목>.sha256`에 적습니다. 불러올 때 파일 해시·엄격한 스키마·내용 해시·유한한 숫자·시장/종목을 모두 확인하고 하나라도 어긋나면 HOLD입니다.
+- `hybrid_eval`: 학습은 시험 세션보다 **앞선** 완결 세션만 사용합니다(기본: 마지막 5세션 시험, 또는 `--train-end-session`/`--holdout-sessions`로 미리 지정). 판단 시점은 가격이 아니라 분봉 존재 여부로만 정합니다: 세션마다 창과 30분 경로가 온전한 첫 봉, 이후 t+31 이상에서 다음 봉. 모델 단독 규칙은 예측 순수익 > 0이면 BUY입니다. `--model`을 줄 때만(그리고 `--max-codex-calls`가 필수) 모델 단독 BUY 시점에 LIVE와 **같은** `live_ai.decide(..., forecast=...)`를 한 번 호출합니다. 입력은 종목 코드(`000000`/`XXXX`)·날짜(2000-01-03으로 이동)·가격(창 시작 = 100)·거래량(창 평균 = 1000)을 익명화하고 t 이후 값은 넣지 않습니다. 모델 단독이 HOLD인 시점은 게이트가 BUY를 거부하므로 호출하지 않습니다. 첫 Codex 오류는 HOLD로 기록하고 이후 호출을 모두 멈추며(재시도 없음) 종료 코드 3과 `hybrid_complete=false`를 남깁니다.
+- 채점: t+1봉 시가 진입, t+30봉 종가 청산, `historical_eval`의 예시 스프레드·비용 가정. **30분 고정 청산은 시험 규약이며 Codex의 SELL도, 실제 자동매매 재현도 아닙니다.** 보고서는 거래 수, 순수익 승률, 평균·중앙 순수익(bp), 1단위 복리 수익률, 최대낙폭을 모델 단독 전체·Codex가 평가한 같은 구간의 모델 단독·하이브리드로 나눠 보여주고, 판단 시점의 예측 진단도 포함합니다. 몇 세션은 작은 표본이므로 `minimum_historical_sample_gate_passed`가 대개 `false`이며 어떤 결과도 미래 수익의 근거가 아닙니다. Codex를 켜면 구독 사용량을 씁니다.
+
+### 뉴스·공시 데이터의 다음 단계
+
+현재 Codex 제안자는 의도적으로 웹 검색을 하지 않으며, 위 과거 시험과 LIVE 입력에도 뉴스가 포함되지 않습니다. 뉴스를 추가할 때는 수집기가 별도로 출처·원문 URL·종목 연결 근거·원문 공개 시각·우리 시스템의 최초 관측 시각·수정 시각을 저장하고, 판단 시점에 **이미 관측된** 자료만 전달해야 합니다. 기사 제목과 본문은 신뢰할 수 없는 데이터로 취급하고, 출처 중복·오보·정정·시간대 오류를 처리해야 합니다. 과거 분봉에 오늘 다시 검색한 기사나 사후 수정된 내용을 섞으면 과거 성과가 부풀 수 있습니다. 한국은 [OpenDART 공시검색](https://opendart.fss.or.kr/guide/detail.do?apiGrpCd=DS001&apiId=2019001), 미국은 [SEC EDGAR 제출 이력 API](https://www.sec.gov/search-filings/edgar-application-programming-interfaces)를 우선 조사합니다. OpenDART 목록의 `rcept_dt`는 날짜만 제공하므로 분 단위 시험에는 별도 공개·관측 시각 기록이 필요합니다. 기사 데이터는 시각과 이용 조건을 검증할 수 있는 공급원을 정한 뒤 연결합니다. 뉴스의 수익 기여는 동일한 과거 구간에서 뉴스 제외/포함을 따로 비교하기 전까지 주장하지 않습니다.
 
 ## 구현 범위
 

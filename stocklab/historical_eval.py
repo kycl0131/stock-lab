@@ -288,11 +288,11 @@ def _baseline_params() -> dict:
     return {"entry_bps": params["entry_bps"].default, "exit_bps": params["exit_bps"].default}
 
 
-def evaluate(data: dict, *, spread_bps: Decimal = DEFAULT_SPREAD_BPS, cost_overrides: dict | None = None) -> dict:
+def resolve_costs(market: str, spread_bps, cost_overrides: dict | None = None) -> tuple[Decimal, dict]:
+    """(spread, costs): the illustrative defaults with validated overrides."""
     spread_bps = Decimal(spread_bps)
     if not spread_bps.is_finite() or not 0 < spread_bps < 1000:
         raise InputError("spread must be between 0 and 1000 bps (exclusive)")
-    market, bars = data["market"], data["bars"]
     costs = dict(DEFAULT_COSTS[market])
     if cost_overrides:
         for name, raw in cost_overrides.items():
@@ -305,6 +305,12 @@ def evaluate(data: dict, *, spread_bps: Decimal = DEFAULT_SPREAD_BPS, cost_overr
             if not value.is_finite() or not 0 <= value < 1000:
                 raise InputError(f"{name} must be between 0 and 1000 bps")
             costs[name] = f"{value:f}"
+    return spread_bps, costs
+
+
+def evaluate(data: dict, *, spread_bps: Decimal = DEFAULT_SPREAD_BPS, cost_overrides: dict | None = None) -> dict:
+    market, bars = data["market"], data["bars"]
+    spread_bps, costs = resolve_costs(market, spread_bps, cost_overrides)
     has_history, has_path = contiguity(bars)
     entry_cost, exit_cost = side_costs_bps(market, costs, spread_bps)
     with localcontext() as ctx:
