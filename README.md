@@ -273,6 +273,24 @@ python -m stocklab --db data/demo.db serve
 
 빈 DB에만 데모가 생성됩니다. KRW·USD 계좌, 합성 가격·뉴스, 주문·부분 체결, 동일비중/모멘텀 비교를 만듭니다. **합성 종목이며 수익성 근거가 아닙니다.** 실제 시장 데이터/백테스트로 오해하지 마세요.
 
+## 과거 신호 오프라인 검증: `historical_eval` (주문 없음)
+
+"과거 신호가 체결됐다면 현재 규칙이 어땠을까"를 **로컬 CSV 분봉만으로** 추정합니다. 증권사·네트워크·유료 모델을 호출하지 않고, 계좌 정보를 읽지 않으며, 주문을 만들지 않습니다.
+
+```powershell
+python -m stocklab.historical_eval --input bars.csv --output report.json            # 스프레드 가정 10bp
+python -m stocklab.historical_eval --input bars.csv --output report.json --spread-bps 20
+python -m stocklab.historical_eval --input bars.csv --output report.json --buy-fee-bps 1.5 --sell-fee-bps 1.5 --sell-tax-bps 20 --slippage-bps 10
+```
+
+- 입력 열(정확히 이 순서): `market,symbol,at_utc,open,high,low,close,volume,source`. 한 파일에 한 시장·한 종목, UTC(`+00:00`/`Z`) 분 단위 시각의 엄격한 오름차순·중복 없음, 양수·정합 OHLC, 0 이상 정수 거래량, 기본 `source=kiwoom-real-readonly-minute`(합성·데모 출처는 거부). `source` 문자열은 파일 작성자의 선언이며, 평가기 자체가 증권사 원본 여부를 인증하지는 않습니다.
+- 정규장(KR 09:00~15:30 KST, US 09:30~16:00 미 동부, 평일)만 허용합니다. 장외 행이 있으면 거부하며, `--drop-outside-session`을 줄 때만 명시적으로 버리고 개수를 보고합니다. 휴장일·조기폐장 캘린더는 반영하지 않습니다.
+- 비교 규칙: `live_ai.baseline`(기본 진입/청산 50bp)과 연구용 `live_research.evaluate_safely`를 **그대로 호출**해 따로 평가합니다. t봉 종가 시점에 t-10..t의 연속 1분 종가 11개만 사용하고 `sellable=false`(매수 신호만)입니다.
+- 가상 거래: BUY면 t+1봉 시가 진입, t+5봉 종가 청산. t..t+5가 같은 세션에서 끊김 없이 이어질 때만 채점하며, 거래 중(t+1..t+5) 신호는 건너뜁니다. 빠진 분봉을 채우거나 세션을 넘지 않습니다.
+- 비용 가정(bp): 호가는 t봉 종가 중심의 **고정 가정 스프레드**(기본 왕복 10bp, 편도 절반)입니다. KR 매수·매도 수수료 1.5, 매도세 20, 슬리피지 편도 10, 환전 0 / US 수수료 25, 매도세 0, 슬리피지 편도 10, 환전 편도 10. `--buy-fee-bps`, `--sell-fee-bps`, `--sell-tax-bps`, `--slippage-bps`, `--fx-cost-bps`로 확인한 요율을 입력할 수 있습니다. **기본값은 예시이며 실제 수수료율이나 과거 호가를 확인한 값이 아닙니다.**
+- 보고서(JSON): 행·세션·적격 구간 수, BUY/HOLD, 거래 수, 총/순 수익 거래 수와 비율, 평균·중앙 순수익(bp), 1단위 순차 복리 수익률과 최대낙폭, 모델 버전과 모든 가정. 거래 0건이면 승률은 `null`(0%가 아님). 거래 30건 미만 또는 거래가 있는 세션 20개 미만이면 `minimum_historical_sample_gate_passed=false`입니다. 이 최소 표본 조건을 통과해도 미래 정확도가 입증되는 것은 아니므로 `future_accuracy_validated`는 항상 `false`입니다.
+- **자동매매 엔진의 정확한 재현이 아닙니다.** 매도 경로, 주문·리스크·수량·포트폴리오 시뮬레이션이 없고, 가정된 체결 결과는 미래 성과의 근거가 아닙니다.
+
 ## 구현 범위
 
 - SQLite 거래 기록, 주문 키 중복 방지, 주문·잔고·체결 원자적 갱신.
