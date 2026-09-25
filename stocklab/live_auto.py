@@ -120,19 +120,17 @@ def validate_config(cfg) -> dict:
     if proposer["kind"] == "BASELINE":
         _keys(proposer, ("kind",), "proposer")
     else:
-        _keys(proposer, ("kind", "provider", "model", "max_output_tokens", "max_calls_per_day", "usd_per_mtok_input",
-                         "usd_per_mtok_output", "krw_per_usd_for_cost"), "proposer")
-        # LIVE model proposals go only to OpenAI; there is no Anthropic path or fallback.
-        if proposer["provider"] not in live_ai.PROVIDERS:
-            raise ValidationError(f"proposer.provider는 {live_ai.PROVIDERS} 중 하나입니다(anthropic 불가).")
+        # LIVE model proposals go only to the Codex CLI under a ChatGPT subscription login. Earlier `openai`
+        # (API key) and `anthropic` configs are rejected; save a new config (which also invalidates arming).
+        if proposer.get("provider") not in live_ai.PROVIDERS:
+            raise ValidationError(f"proposer.provider는 {live_ai.PROVIDERS} 만 허용합니다(openai API·anthropic 설정 "
+                                  "거부). `auto template`으로 새 설정을 저장하세요.")
+        _keys(proposer, ("kind", "provider", "model", "max_calls_per_day", "timeout_seconds"), "proposer")
         if not isinstance(proposer["model"], str) or not re.fullmatch(live_ai.MODEL_ID_PATTERN, proposer["model"]) \
                 or proposer["model"].startswith("claude"):
-            raise ValidationError("proposer.model에 정확한 OpenAI 모델 ID를 적으세요.")
-        _int(proposer["max_output_tokens"], "max_output_tokens", *live_ai.MAX_OUTPUT_TOKENS_RANGE)
+            raise ValidationError("proposer.model에 Codex CLI에서 쓸 정확한 모델 ID를 적으세요.")
         _int(proposer["max_calls_per_day"], "max_calls_per_day", 1, 200)
-        _bps(proposer["usd_per_mtok_input"], "usd_per_mtok_input", 1000)
-        _bps(proposer["usd_per_mtok_output"], "usd_per_mtok_output", 1000)
-        _bps(proposer["krw_per_usd_for_cost"], "krw_per_usd_for_cost", 2500)
+        _int(proposer["timeout_seconds"], "timeout_seconds", *live_ai.TIMEOUT_SECONDS_RANGE)
     base = _keys(cfg["baseline"], ("entry_bps", "exit_bps"), "baseline")
     _int(base["entry_bps"], "entry_bps", 1, 5000)
     _int(base["exit_bps"], "exit_bps", 1, 5000)
@@ -185,9 +183,8 @@ def template() -> dict:
     return {"schema": CONFIG_SCHEMA, "capital_cap_krw": None, "max_total_loss_krw": None, "arm_max_hours": None,
             "cycle": {"interval_seconds": None, "lookback_bars": None, "max_bar_age_seconds": None,
                       "max_quote_age_seconds": None, "collar_bps": None, "max_spread_bps": None},
-            "proposer": {"kind": "MODEL | BASELINE", "provider": "openai", "model": None, "max_output_tokens": None,
-                         "max_calls_per_day": None, "usd_per_mtok_input": None, "usd_per_mtok_output": None,
-                         "krw_per_usd_for_cost": None},
+            "proposer": {"kind": "MODEL | BASELINE", "provider": "codex_cli", "model": None,
+                         "max_calls_per_day": None, "timeout_seconds": None},
             "baseline": {"entry_bps": None, "exit_bps": None},
             "markets": {"KR": {**market, "costs": {k: None for k in COST_KEYS["KR"]}},
                         "US": {**market, "costs": {k: None for k in COST_KEYS["US"]}}},
@@ -430,13 +427,14 @@ def _other_mark_usable(conn, cfg, market, book, mark, at):
 
 
 def _model_cost_krw(conn, market, mode) -> Decimal:
+    """Sum of recorded per-decision costs; earlier API-billed rows keep their stored amounts."""
     rows = conn.execute("SELECT d.model_cost_krw FROM auto_decisions d JOIN auto_cycles c ON c.cycle_key = d.cycle_key "
                         "WHERE c.market = ? AND c.mode = ?", (market, mode)).fetchall()
     return sum((Decimal(r[0]) for r in rows), Decimal(0))
 
 
 def _recent_model_calls(conn, since) -> int:
-    """Count paid-call attempts across both modes; quota limits actual API spending globally.
+    """Count model-call attempts across both modes; the quota bounds subscription usage globally.
 
     Older rows without a `called` flag count conservatively. A cycle skipped because the
     quota was already exhausted has `called: false` and must not extend the cooldown.
@@ -444,14 +442,6 @@ def _recent_model_calls(conn, since) -> int:
     rows = conn.execute("SELECT model_meta_json FROM auto_decisions WHERE proposer = 'MODEL' AND created_at > ?",
                         (since,)).fetchall()
     return sum(json.loads(r["model_meta_json"]).get("called") is not False for r in rows)
-
-
-def _cost_krw(proposer, usage) -> Decimal:
-    if proposer["kind"] != "MODEL" or not usage:
-        return Decimal(0)
-    usd = (Decimal(usage.get("input_tokens", 0)) * Decimal(proposer["usd_per_mtok_input"])
-           + Decimal(usage.get("output_tokens", 0)) * Decimal(proposer["usd_per_mtok_output"])) / Decimal(1_000_000)
-    return (usd * Decimal(proposer["krw_per_usd_for_cost"])).quantize(Decimal("0.01"))
 
 
 def _reconcile_first(conn, market, mode):
@@ -579,9 +569,10 @@ def _cycle_body(conn, *, key, market, mode, arm_id, cfg, session, clock):
                 {"error": "DAILY_MODEL_CALL_LIMIT", "called": False}
         else:
             proposal, meta = live_ai.decide(snapshot, provider=proposer["provider"], model=proposer["model"],
-                                            max_output_tokens=proposer["max_output_tokens"])
+                                            timeout=proposer["timeout_seconds"])
             meta["called"] = True
-    cost = _cost_krw(proposer, meta.get("usage"))
+    # Subscription calls are recorded as 0 KRW: no per-call bill, but not free (subscription limits apply).
+    cost = Decimal(0)
     # Research-only candidate on the same snapshot and quotes: recorded in the immutable decision row, never
     # passed to risk.plan, never a ticket. Stored under model_meta_json so no schema change is needed.
     research = live_research.evaluate_safely(snapshot, {s: {"bid": f["bid"], "ask": f["ask"]}
@@ -766,8 +757,9 @@ def _decision_summary(row) -> dict:
     except ValidationError:
         replayable = False
     return {"cycle_key": row["cycle_key"], "proposer": row["proposer"], "proposal": json.loads(row["proposal_json"]),
-            "baseline": json.loads(row["baseline_json"]), "model": meta.get("model"), "model_error": meta.get("error"),
-            "model_cost_krw": row["model_cost_krw"], "evidence_version": row["evidence_version"],
+            "baseline": json.loads(row["baseline_json"]), "model_provider": meta.get("provider"),
+            "model": meta.get("model"), "model_billing": meta.get("billing"), "model_usage": meta.get("usage"),
+            "model_error": meta.get("error"), "model_cost_krw": row["model_cost_krw"], "evidence_version": row["evidence_version"],
             "evidence_hash": row["evidence_hash"], "snapshot_replayable": replayable,
             "research_candidate": None if not isinstance(research, dict) else {
                 "version": research.get("version"), "proposal": research.get("proposal"),

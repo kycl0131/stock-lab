@@ -201,7 +201,7 @@ class HistoricalEvalTest(unittest.TestCase):
 
         def refuse(*_a, **_k):
             raise AssertionError("network access attempted")
-        with patch.object(socket.socket, "connect", refuse), patch.object(live_ai, "urlopen", refuse), \
+        with patch.object(socket.socket, "connect", refuse), patch.object(live_ai, "_run", refuse), \
                 patch.object(live_ai, "propose", refuse), redirect_stdout(io.StringIO()):
             self.assertEqual(he.main(["--input", str(csv_path), "--output", str(out)]), 0)
         report = json.loads(out.read_text(encoding="utf-8"))
