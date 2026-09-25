@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-lab"
+version = "0.1.0"
+description = "Point-in-time equity research and paper execution for personal accounts"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+stocklab = "stocklab.cli:main"
+
+[tool.setuptools.package-data]
+stocklab = ["web/*.html"]
+
+[tool.setuptools.packages.find]
+include = ["stocklab*"]
