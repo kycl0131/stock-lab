@@ -139,7 +139,15 @@
 - `capital_cap_krw`: 총 자본 상한(원). 이 프로그램이 보유한 수량의 원화 매입가 합과 미종결 BUY 예약액의 합이 넘을 수 없습니다. **계좌 현금을 전부 쓰지 않습니다.**
 - 시장별 `universe`(최대 8종목, KR `KRX`, US `ND/NY/NA`), `max_order_krw`, `max_position_krw`, `max_daily_loss_krw`, `max_orders_per_day`, `costs`(수수료·매도세·슬리피지, US는 환전 bps), 장 시작 후·마감 전 여유(분, KR 마감 전 ≥ 15분), `calendar`.
 - `calendar`: KRX·NYSE/Nasdaq 공식 공지에서 옮겨 적은 거래일·정규장 시각(최대 200일, 출처 필수). 유효 기간 안에 없는 날은 휴장이고, 기간 밖이면 주문하지 않습니다. 요일 규칙으로 추정하지 않습니다. 미국 시각은 법정 서머타임 규칙(3월 둘째 일요일~11월 첫째 일요일, 2007~2030년만 허용)으로 변환하고, 시스템 시간대 DB가 있으면 둘이 일치해야 합니다.
-- `max_total_loss_krw`, `cycle`(간격 ≥ 120초, 분봉 수, 분봉·호가 최대 나이, 가격 칼라·최대 스프레드 bps), `proposer`(`MODEL`: 제공자·정확한 모델 ID·max_tokens·하루 호출 상한·토큰 단가, 또는 `BASELINE`), `baseline` 임계값, `arm_max_hours`(≤ 168).
+- `max_total_loss_krw`, `cycle`(간격 ≥ 120초, 분봉 수, 분봉·호가 최대 나이, 가격 칼라·최대 스프레드 bps), `proposer`(`MODEL`: `provider`는 `openai`만 허용·정확한 OpenAI 모델 ID(기본값 없음)·`max_output_tokens`(200~8000)·하루 호출 상한·토큰 단가, 또는 `BASELINE`), `baseline` 임계값, `arm_max_hours`(≤ 168). `anthropic` 제공자·`claude*` 모델·이전 키 `max_tokens`는 거부됩니다.
+
+**LIVE 모델 제안자 (`MODEL`)**: [live_ai.py](stocklab/live_ai.py)가 OpenAI Responses API(`POST https://api.openai.com/v1/responses`)를 표준 라이브러리 `urllib`로 한 번 호출합니다. 다른 제공자·모델로의 대체는 없습니다.
+- 키: 로컬 환경변수 `OPENAI_API_KEY`에서만 읽습니다(`.env` 자동 로드 없음). 키는 출력·기록하지 않습니다.
+- 결제: ChatGPT/Codex 구독과 OpenAI API 과금은 별도입니다. 이 기능은 별도 API 키와 API 결제 설정이 필요하며, 키가 없거나 API 요청이 실패하면 HOLD가 됩니다. 실제 호출 전 [API 요금](https://developers.openai.com/api/docs/pricing)과 API 프로젝트 지출 한도를 확인하세요.
+- `--dry-run`도 `MODEL` 제안자를 선택했다면 실제 OpenAI API를 호출하므로 사용료가 발생할 수 있습니다. 주문만 가상으로 처리합니다.
+- 요청: 검증된 시세 전용 스냅샷(`input`)과 BUY/SELL/HOLD 중 하나를 고르라는 지시(`instructions`), 설정의 모델 ID, `tools: []`, `store: false`, `max_output_tokens`, `text.format`의 strict `json_schema`(`action`/`symbol`/`reason`/`evidence_ids`). 계좌·현금·수량·키는 보내지 않습니다.
+- 응답: `status=completed`이고 assistant 메시지 1개, `output_text` 1개일 때만 JSON을 읽고 `validate_proposal`로 검증합니다. 거절(refusal), `incomplete`/`failed`, 오류 필드, 도구 호출·여러 출력·잘못된 JSON·중복 키, HTTP·네트워크·시간 초과 오류는 모두 HOLD이며 재시도하지 않습니다.
+- 기록: `model_meta_json`에 제공자, 요청·실제 모델, 응답 ID, 토큰 사용량(input/output/total/reasoning), 프롬프트·스냅샷 해시, 오류 분류를 남깁니다. 비밀 값은 없습니다. 모델 출력은 제안일 뿐이며 수량·가격은 위험 엔진이 정합니다.
 
 **arm (`auto arm`)**: 확인 문구 `ARM REAL AUTO <설정 해시 12자> <N>H`를 대화형 터미널에서 입력합니다. arm은 최신 설정과 시장별 최신 `live cap`에 묶이고 N시간 뒤 만료됩니다. 활성 시장에 `live cap`이 없으면 arm 하지 않습니다. 다음 경우 권한이 즉시 사라집니다: 새 설정, 새 `live cap`, `auto disarm`, 만료, `live halt --market ALL`, 손실 트리거, 결과불명 주문, 종결 오류. 같은 검사가 Python과 SQLite 트리거(주문 의도 생성·`ATTEMPTED` 전환) 양쪽에 있고, 전송 직전 `submit`에서 한 번 더 확인합니다. 재시작한 프로세스도 기존 arm이 여전히 유효할 때만 이어서 동작하며 스스로 다시 arm 하지 않습니다.
 
@@ -153,7 +161,7 @@
    - US: `usa06011` 1분봉, `usa20101` 최우선 호가(`dt`+`bid_tm`), `usa20100`(`trd_susp_tp=0`, `curr_unit=USD`, `base_exrt`).
    - 최신 분봉·호가가 설정한 나이를 넘거나, 미래 시각이거나, 순서가 틀리거나, 형식이 어긋나면 그 시장 전체가 관망합니다. US 시각대는 KST와 미국 동부 해석 중 정확히 하나만 최근일 때만 인정하고, 스냅샷 안의 모든 US 시각이 같은 해석이어야 합니다. 모델에는 숫자·시각·증거 ID·`sellable` 여부만 보냅니다. 종목명·뉴스·문자열·계좌번호·잔고·수량·키는 보내지 않습니다. 모의/연구 DB나 합성 가격은 사용하지 않습니다.
 4. 증권사 주문가능현금(`live send`와 같은 조회)과 US 환율을 읽고, 기록된 체결로 손익과 노출을 계산해 `auto_marks`에 남깁니다(`live_risk.py` 설명 참조). LIVE와 DRY_RUN의 손익 기록·모델 비용을 분리합니다. 일 손익은 같은 모드의 이전 세션 마지막 기록을 기준으로 계산해 밤사이 가격 변동을 포함하며, 이전 기록이 없다면 0원 또는 첫 기록의 양의 손익을 기준으로 사용합니다. 이전 기록은 장중이거나 며칠 전의 것일 수 있으므로 공식 전일 종가를 뜻하지 않습니다. 시장 일 손실이나 두 시장 합산 누적 손실이 기준에 닿으면 disarm하고 관망합니다. 다른 시장에 보유수량이 있으면 공식 캘린더상 마지막 완료 거래일의 마감 창 근처 기록만 합산합니다. 다른 시장 포지션이 없으면 마지막 확정 손익 기록을 사용합니다. 손익을 계산할 수 없거나 다른 시장 기록이 불확실하면 BUY는 막고 SELL만 허용합니다.
-5. 제안: `MODEL`이면 모델을 한 번 호출합니다(재시도·대체 모델 없음, 24시간 호출 상한은 LIVE와 DRY_RUN을 합산한 실제 호출 시도 기준). 실패·형식 오류·범위 밖 종목·보유하지 않은 종목의 SELL은 HOLD가 됩니다. 결정론적 기준 규칙(`stocklab-baseline-trend-v1`, 구간 수익률 임계값)의 제안도 항상 함께 기록합니다. 증거·제안·모델 메타데이터·비용은 주문 전에 `auto_decisions`에 변경 불가로 저장됩니다.
+5. 제안: `MODEL`이면 OpenAI 모델을 한 번 호출합니다(재시도·대체 제공자·대체 모델 없음, 24시간 호출 상한은 LIVE와 DRY_RUN을 합산한 실제 호출 시도 기준). 실패·형식 오류·범위 밖 종목·보유하지 않은 종목의 SELL은 HOLD가 됩니다. 결정론적 기준 규칙(`stocklab-baseline-trend-v1`, 구간 수익률 임계값)의 제안도 항상 함께 기록합니다. 증거·제안·모델 메타데이터·비용은 주문 전에 `auto_decisions`에 변경 불가로 저장됩니다.
    - **연구 전용 후보 `stocklab-research-costaware-drift-v1`** ([live_research.py](stocklab/live_research.py)): 같은 세션 스냅샷과 같은 호가로 매 주기 계산해 `model_meta_json.research_candidate`에 제안·버전·입력 해시·비용 진단을 기록합니다. 규칙: 최근 1분 수익률 10개(연속 1분봉 11개)의 평균·표본표준편차로 t값을 구하고, |t| ≥ 2일 때 평균 × 5분을 단순 외삽한 기대 변화(bps)가 왕복 비용 허들(호가 스프레드 + 매수·매도 수수료 + 매도세 + 슬리피지×2 + US 환전×2, 설정 `costs` 값)을 넘으면 BUY(미보유)/SELL(보유) 후보, 아니면 HOLD입니다. 학습·적합이 없고 외삽값은 보정된 수익 예측이 아닙니다. 이 후보는 위험 엔진(`risk.plan`)에 들어가지 않고 티켓을 만들지 않으며, `proposer.kind`로 선택할 수 없습니다(`MODEL`/`BASELINE`만 허용).
 6. 위험 엔진이 주문을 최대 1건 만듭니다. BUY는 최우선 매도호가, SELL은 최우선 매수호가로 냅니다. 스프레드와 최근 체결가 대비 거리가 칼라 안이어야 합니다. BUY 수량은 설정 주문 한도, `live cap` 주문당·잔여 누적 한도, 총 자본 상한 잔여, 종목 한도, 주문가능현금 × 현금 비율 중 최솟값을 비용 버퍼를 포함한 1주 가격으로 나눈 값입니다. US는 환율로 환산하고, 계좌 환율과 시세 환율이 3% 넘게 다르면 거부합니다. SELL은 이 프로그램이 산 확인 수량 전부입니다. 한 종목에는 한 번에 한 포지션만 둡니다.
 7. LIVE: 호가를 새로 조회해 다시 계산합니다. 티켓과 주문 의도를 한 트랜잭션에 만들고, `live send`와 같은 경로(증권사 재조회, 게이트, `ATTEMPTED`, 1회 전송 권한 `submission_claims`)로 정확히 1회 전송합니다. 접수가 아니면(UNKNOWN) disarm하고 재전송하지 않습니다. 예상하지 못한 오류는 해당 시장을 영구 halt하고 disarm합니다.
@@ -248,7 +256,7 @@ uv pip install --python .venv/Scripts/python.exe ./vendor/kiwoom-official
 .\.venv\Scripts\python.exe -m stocklab --db data/pilot.db pilot-status
 ```
 
-- 기본 전략은 무료 결정론적 기준 전략(`momentum`/`equal`)입니다. 외부 모델 결과는 `--strategy file`, 유료 Claude 추론은 `--strategy anthropic`을 **명시했을 때만** 실행됩니다.
+- 기본 전략은 무료 결정론적 기준 전략(`momentum`/`equal`)입니다. 외부 모델 결과는 `--strategy file`, 유료 Claude 추론은 `--strategy anthropic`을 **명시했을 때만** 실행됩니다. 이 과거 연구용 `run` 경로는 실계좌 자동매매(`auto`)의 판단 경로가 **아닙니다**. LIVE 모델 제안자는 OpenAI만 사용합니다.
 - **두 시장을 시간 순서대로** 운영합니다(국내 장 마감 06:30Z → 같은 날 미국 20:00Z). 합계 손실 계산은 두 장부를 같은 시점으로 평가하므로, 한 시장의 시계가 앞서 있으면 다른 시장의 신규 매수는 평가 불가로 차단됩니다. 미국 종목을 보유한 경우 금요일 미국 종가가 월요일 국내 장 마감 시점에는 24시간을 넘으므로, 거래 캘린더를 추가하기 전까지 월요일 국내 신규 매수는 차단됩니다.
 - `pilot-status --as-of ...`는 지정 시점 이하의 모의 시세만 사용합니다. 계좌 시계 이전 시점은 거부합니다. 시세 누락·만료 시장은 `UNAVAILABLE`로 표시하고 신규 매수를 막으며, 합계 평가가 불가하면 종료 코드 2입니다.
 
@@ -345,7 +353,7 @@ python -m stocklab --db data/research.db run --market US --as-of 2026-09-01T20:0
 
 `run --strategy file --decision-file decision.json`으로 가져옵니다. 데이터/계좌 상태가 달라지면 해시 불일치로 거부합니다. 해당 파일 생성 시점과 모델 학습 데이터의 미래 정보 포함 여부는 인증하지 않습니다.
 
-선택적 Claude API: 로컬 환경변수 `ANTHROPIC_API_KEY`, `STOCKLAB_MODEL` 설정 후 `run --strategy anthropic`을 명시하면 유료 요청 1회를 실행합니다. `.env`는 자동 로드하지 않습니다. 증권사 키는 전송하지 않으며, 해당 연구 스냅샷의 시세·뉴스·모의 포트폴리오가 모델 제공사에 전송됩니다. 최대 입력 100 KB, 출력 2,200 토큰, 자동 재시도 없음.
+선택적 Claude API(연구용 `run` 전용, 실계좌 `auto` 판단 경로 아님): 로컬 환경변수 `ANTHROPIC_API_KEY`, `STOCKLAB_MODEL` 설정 후 `run --strategy anthropic`을 명시하면 유료 요청 1회를 실행합니다. `.env`는 자동 로드하지 않습니다. 증권사 키는 전송하지 않으며, 해당 연구 스냅샷의 시세·뉴스·모의 포트폴리오가 모델 제공사에 전송됩니다. 최대 입력 100 KB, 출력 2,200 토큰, 자동 재시도 없음.
 
 재사용 설계:
 

@@ -120,13 +120,15 @@ def validate_config(cfg) -> dict:
     if proposer["kind"] == "BASELINE":
         _keys(proposer, ("kind",), "proposer")
     else:
-        _keys(proposer, ("kind", "provider", "model", "max_tokens", "max_calls_per_day", "usd_per_mtok_input",
+        _keys(proposer, ("kind", "provider", "model", "max_output_tokens", "max_calls_per_day", "usd_per_mtok_input",
                          "usd_per_mtok_output", "krw_per_usd_for_cost"), "proposer")
+        # LIVE model proposals go only to OpenAI; there is no Anthropic path or fallback.
         if proposer["provider"] not in live_ai.PROVIDERS:
-            raise ValidationError(f"proposer.provider는 {live_ai.PROVIDERS} 중 하나입니다.")
-        if not isinstance(proposer["model"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9.\-]{2,79}", proposer["model"]):
-            raise ValidationError("proposer.model에 정확한 모델 ID를 적으세요.")
-        _int(proposer["max_tokens"], "max_tokens", 200, 4000)
+            raise ValidationError(f"proposer.provider는 {live_ai.PROVIDERS} 중 하나입니다(anthropic 불가).")
+        if not isinstance(proposer["model"], str) or not re.fullmatch(live_ai.MODEL_ID_PATTERN, proposer["model"]) \
+                or proposer["model"].startswith("claude"):
+            raise ValidationError("proposer.model에 정확한 OpenAI 모델 ID를 적으세요.")
+        _int(proposer["max_output_tokens"], "max_output_tokens", *live_ai.MAX_OUTPUT_TOKENS_RANGE)
         _int(proposer["max_calls_per_day"], "max_calls_per_day", 1, 200)
         _bps(proposer["usd_per_mtok_input"], "usd_per_mtok_input", 1000)
         _bps(proposer["usd_per_mtok_output"], "usd_per_mtok_output", 1000)
@@ -183,7 +185,7 @@ def template() -> dict:
     return {"schema": CONFIG_SCHEMA, "capital_cap_krw": None, "max_total_loss_krw": None, "arm_max_hours": None,
             "cycle": {"interval_seconds": None, "lookback_bars": None, "max_bar_age_seconds": None,
                       "max_quote_age_seconds": None, "collar_bps": None, "max_spread_bps": None},
-            "proposer": {"kind": "MODEL | BASELINE", "provider": "anthropic", "model": None, "max_tokens": None,
+            "proposer": {"kind": "MODEL | BASELINE", "provider": "openai", "model": None, "max_output_tokens": None,
                          "max_calls_per_day": None, "usd_per_mtok_input": None, "usd_per_mtok_output": None,
                          "krw_per_usd_for_cost": None},
             "baseline": {"entry_bps": None, "exit_bps": None},
@@ -577,7 +579,7 @@ def _cycle_body(conn, *, key, market, mode, arm_id, cfg, session, clock):
                 {"error": "DAILY_MODEL_CALL_LIMIT", "called": False}
         else:
             proposal, meta = live_ai.decide(snapshot, provider=proposer["provider"], model=proposer["model"],
-                                            max_tokens=proposer["max_tokens"])
+                                            max_output_tokens=proposer["max_output_tokens"])
             meta["called"] = True
     cost = _cost_krw(proposer, meta.get("usage"))
     # Research-only candidate on the same snapshot and quotes: recorded in the immutable decision row, never
