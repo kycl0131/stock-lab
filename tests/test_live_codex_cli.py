@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from stocklab import live_ai, live_auto as auto, live_orders as lo
+from stocklab import live_ai, live_auto as auto, live_orders as lo, ts_forecast as ts
 from stocklab.domain import ValidationError, canonical, digest, now
 from test_session_research import KST, FakeKrClient, kr_config, uptrend_session_rows  # tests/ is on sys.path
 
@@ -337,8 +337,18 @@ class BoundedRunnerTests(unittest.TestCase):
 
 
 def model_config(**proposer):
-    return {**kr_config(), "proposer": {"kind": "MODEL", "provider": "codex_cli", "model": MODEL,
-                                        "max_calls_per_day": 20, "timeout_seconds": 120, **proposer}}
+    cfg = kr_config()
+    cfg["cycle"]["lookback_bars"] = ts.WINDOW_BARS
+    model_proposer = {"kind": "MODEL", "provider": "codex_cli", "model": MODEL,
+                      "max_calls_per_day": 20, "timeout_seconds": 120,
+                      "forecast": {"artifacts": {"KR": {"005930": {
+                          "path": str(Path(tempfile.gettempdir(), "stocklab-test-missing-model.json")),
+                          "sha256": "0" * 64}}}, "max_artifact_age_days": 30},
+                      "news": {"archive_path": str(Path(tempfile.gettempdir(), "stocklab-test-missing-news.json")),
+                               "max_status_age_seconds": 900, "lookback_hours": 24, "max_items_per_symbol": 5,
+                               "required_sources": {"KR": ["gdelt"], "US": ["gdelt"]}}}
+    model_proposer.update(proposer)
+    return {**cfg, "proposer": model_proposer}
 
 
 def openai_config():
@@ -373,7 +383,10 @@ class LiveConfigTests(unittest.TestCase):
         pin = {"<symbol>": {"path": None, "sha256": None}}
         self.assertEqual(proposer, {"kind": "MODEL | BASELINE", "provider": "codex_cli", "model": None,
                                     "max_calls_per_day": None, "timeout_seconds": None,
-                                    "forecast": {"artifacts": {"KR": pin, "US": pin}, "max_artifact_age_days": None}})
+                                    "forecast": {"artifacts": {"KR": pin, "US": pin}, "max_artifact_age_days": None},
+                                    "news": {"archive_path": None, "max_status_age_seconds": None,
+                                             "lookback_hours": None, "max_items_per_symbol": None,
+                                             "required_sources": {"KR": [None], "US": [None]}}})
         with self.assertRaises(ValidationError):
             auto.validate_config(auto.template())
 
@@ -425,20 +438,12 @@ class LiveCycleTests(OfflineCase):
         self.assertEqual(self.cycle(fake)["skipped"], "NO_CONFIG")
         self.assertEqual(fake.calls, [])
 
-    def test_model_without_forecast_config_holds_without_codex_call(self):
-        # The subscription-audit path with a pinned forecast is covered in test_ts_forecast.LiveForecastCycleTests.
-        self.save(model_config())
-        fake = FakeRun()
-        result = self.cycle(fake)
-        self.assertEqual(result["status"], "COMPLETED", result)
-        self.assertEqual(result["outcome"]["proposal"]["action"], "HOLD")
-        self.assertEqual(result["outcome"]["model_error"], "FORECAST:FORECAST_NOT_CONFIGURED")
-        self.assertEqual(fake.calls, [], "no login check and no codex exec without a forecast")
-        row = self.conn.execute("SELECT * FROM auto_decisions").fetchone()
-        self.assertEqual((row["proposer"], row["model_cost_krw"]), ("MODEL", "0"))
-        self.assertIs(json.loads(row["model_meta_json"])["called"], False)
-        for table in ("tickets", "auto_intents", "submission_claims"):
-            self.assertEqual(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0, table)
+    def test_model_config_requires_time_series_and_news_inputs(self):
+        for field in ("forecast", "news"):
+            config = model_config()
+            del config["proposer"][field]
+            with self.subTest(field), self.assertRaises(ValidationError):
+                auto.validate_config(config)
 
     def test_live_cycle_without_forecast_is_hold_without_order(self):
         self.save(model_config())

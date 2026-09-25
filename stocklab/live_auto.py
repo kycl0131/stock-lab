@@ -35,7 +35,7 @@ import time
 
 from .domain import ValidationError, canonical, digest, now
 from . import live_ai, live_calendar as cal, live_evidence as ev, live_orders as lo, live_research, live_risk as risk
-from . import ts_forecast as ts
+from . import news, ts_forecast as ts
 
 CONFIG_SCHEMA = "stocklab-auto-config-v1"
 MAX_UNIVERSE = 8
@@ -128,9 +128,10 @@ def validate_config(cfg) -> dict:
         if proposer.get("provider") not in live_ai.PROVIDERS:
             raise ValidationError(f"proposer.provider는 {live_ai.PROVIDERS} 만 허용합니다(openai API·anthropic 설정 "
                                   "거부). `auto template`으로 새 설정을 저장하세요.")
-        # `forecast` pins the time-series artifacts. Without it a MODEL cycle HOLDs and never calls Codex.
-        _keys(proposer, ("kind", "provider", "model", "max_calls_per_day", "timeout_seconds")
-              + (("forecast",) if "forecast" in proposer else ()), "proposer")
+        # A LIVE MODEL decision requires both pinned time-series artifacts and point-in-time news evidence. Missing
+        # or stale inputs must stop the cycle before Codex is called, rather than silently changing the strategy.
+        _keys(proposer, ("kind", "provider", "model", "max_calls_per_day", "timeout_seconds", "forecast", "news"),
+              "proposer")
         if not isinstance(proposer["model"], str) or not re.fullmatch(live_ai.MODEL_ID_PATTERN, proposer["model"]) \
                 or proposer["model"].startswith("claude"):
             raise ValidationError("proposer.model에 Codex CLI에서 쓸 정확한 모델 ID를 적으세요.")
@@ -173,10 +174,11 @@ def validate_config(cfg) -> dict:
         cal.validate_calendar(market, m["calendar"])
     if not enabled:
         raise ValidationError("활성화된 시장이 없습니다.")
-    if proposer["kind"] == "MODEL" and "forecast" in proposer:
+    if proposer["kind"] == "MODEL":
         ts.validate_forecast_config(proposer["forecast"],
                                     {mk: [u["symbol"] for u in m["universe"]] for mk, m in markets.items() if m["enabled"]},
                                     cycle["lookback_bars"])
+        news.validate_config(proposer["news"], {mk: m["universe"] for mk, m in markets.items() if m["enabled"]})
     if len(canonical(cfg).encode("utf-8")) > 200_000:
         raise ValidationError("설정 파일이 너무 큽니다.")
     return cfg
@@ -196,7 +198,10 @@ def template() -> dict:
                          "max_calls_per_day": None, "timeout_seconds": None,
                          "forecast": {"artifacts": {"KR": {"<symbol>": {"path": None, "sha256": None}},
                                                     "US": {"<symbol>": {"path": None, "sha256": None}}},
-                                      "max_artifact_age_days": None}},
+                                      "max_artifact_age_days": None},
+                         "news": {"archive_path": None, "max_status_age_seconds": None, "lookback_hours": None,
+                                  "max_items_per_symbol": None,
+                                  "required_sources": {"KR": [None], "US": [None]}}},
             "baseline": {"entry_bps": None, "exit_bps": None},
             "markets": {"KR": {**market, "costs": {k: None for k in COST_KEYS["KR"]}},
                         "US": {**market, "costs": {k: None for k in COST_KEYS["US"]}}},
@@ -592,13 +597,29 @@ def _cycle_body(conn, *, key, market, mode, arm_id, cfg, session, clock):
             except Exception as exc:  # defensive: a forecaster bug must not become a model call or an order
                 forecast, forecast_error = None, "FORECAST:UNEXPECTED_" + re.sub(r"[^A-Za-z0-9_]", "",
                                                                               type(exc).__name__)[:60]
+            # Point-in-time news from the separately collected archive (no network here). This input is required;
+            # a missing, failed or stale feed is a HOLD with no call; a fresh feed with no matching items is empty.
+            news_obj, news_audit, news_error = None, None, None
+            if forecast is not None:
+                try:
+                    news_obj, news_audit = news.live_evidence(proposer["news"], snapshot, now=clock())
+                except ValidationError as exc:
+                    news_error = f"NEWS:{str(exc)[:160]}"
+                except Exception as exc:  # defensive: a news bug must not become a model call or an order
+                    news_error = "NEWS:UNEXPECTED_" + re.sub(r"[^A-Za-z0-9_]", "", type(exc).__name__)[:60]
             if forecast is None:
                 proposal, meta = {**live_ai.HOLD, "reason": "time-series forecast unavailable; abstain"}, \
                     {"error": forecast_error, "called": False}
+            elif news_error is not None:
+                proposal, meta = {**live_ai.HOLD, "reason": "news feed missing, failed or stale; abstain"}, \
+                    {"error": news_error, "called": False, "forecast": forecast, "forecast_artifacts": forecast_audit}
             else:
                 proposal, meta = live_ai.decide(snapshot, provider=proposer["provider"], model=proposer["model"],
-                                                timeout=proposer["timeout_seconds"], forecast=forecast)
+                                                timeout=proposer["timeout_seconds"], forecast=forecast,
+                                                news=news_obj)
                 meta.update({"called": True, "forecast": forecast, "forecast_artifacts": forecast_audit})
+                if news_obj is not None:
+                    meta.update({"news": news_obj, "news_audit": news_audit})
     # Subscription calls are recorded as 0 KRW: no per-call bill, but not free (subscription limits apply).
     cost = Decimal(0)
     # Research-only candidate on the same snapshot and quotes: recorded in the immutable decision row, never
@@ -788,6 +809,7 @@ def _decision_summary(row) -> dict:
             "baseline": json.loads(row["baseline_json"]), "model_provider": meta.get("provider"),
             "model": meta.get("model"), "model_billing": meta.get("billing"), "model_usage": meta.get("usage"),
             "model_error": meta.get("error"), "forecast_gate": meta.get("forecast_gate"),
+            "news_items": meta.get("news_items"), "news_hash": meta.get("news_hash"),
             "model_cost_krw": row["model_cost_krw"], "evidence_version": row["evidence_version"],
             "evidence_hash": row["evidence_hash"], "snapshot_replayable": replayable,
             "research_candidate": None if not isinstance(research, dict) else {

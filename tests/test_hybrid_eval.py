@@ -139,7 +139,7 @@ class HybridEvalTests(OfflineCase):
         self.assertEqual(report["results"]["model_only_same_window"]["trades"], 1)
         errored = [d for d in report["decisions"] if "codex_error" in d]
         self.assertEqual(len(errored), 1)
-        self.assertEqual(errored[0]["hybrid"], "HOLD")
+        self.assertNotIn("hybrid", errored[0], "an inference failure is not an observed HOLD")
 
     def test_codex_inputs_depend_only_on_bars_through_t(self):
         bars = self.data["bars"]

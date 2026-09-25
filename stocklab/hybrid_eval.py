@@ -20,6 +20,16 @@ Hybrid    at a model-only BUY, while fewer than --max-codex-calls calls were mad
 Scoring   BUY: entry at the open of t+1, exit at the close of t+30, with historical_eval's illustrative spread and
           cost assumptions. The fixed 30-minute exit is a test convention, not a Codex SELL; there is no broker,
           order, risk, sizing, portfolio or calendar simulation.
+News      optional (--news-archive, a news_collect archive). At each decision point the LIVE rule applies with the
+          decision time in place of now: every required source needs an OK archive-committed run within
+          --news-max-age-seconds, and only records with max(available_at, run.committed_at) <= decision time are
+          used. Covered points are reported; with Codex, a covered model-only BUY gets three calls with the same
+          snapshot and forecast: without news, with news instructions/coverage but no items, and with actual items.
+          The four arms (including model-only) use exactly those covered windows. These are independent single
+          samples, not a causal or profitability estimate. With no covered point, no news result is produced. News
+          titles are not anonymised: they can reveal the issuer and period to the model.
+    python -m stocklab.hybrid_eval --input bars.csv --output artifacts/hybrid.json --model <id> \
+        --max-codex-calls 40 --news-archive data/news/archive.json --news-sources gdelt,opendart
 """
 from __future__ import annotations
 
@@ -31,7 +41,7 @@ from pathlib import Path
 import re
 import sys
 
-from . import historical_eval as he, live_ai, ts_forecast as ts
+from . import historical_eval as he, live_ai, news as nw, ts_forecast as ts
 from .domain import ValidationError
 
 REPORT_VERSION = "stocklab-hybrid-eval-v1"
@@ -72,9 +82,13 @@ def schedule(bars, test_sessions) -> list[int]:
     return points
 
 
+def anon_shift(window: list) -> timedelta:
+    return timedelta(days=(date.fromisoformat(window[-1]["session"]) - ANON_DATE).days)
+
+
 def anonymized_snapshot(market: str, window: list) -> dict:
     """Snapshot of exactly the decision window with identity and calendar date removed."""
-    shift = timedelta(days=(date.fromisoformat(window[-1]["session"]) - ANON_DATE).days)
+    shift = anon_shift(window)
     base = window[0]["close"]
     mean_volume = Decimal(sum(b["volume"] for b in window)) / len(window)
     symbol = ANON_SYMBOL[market]
@@ -97,9 +111,39 @@ def _trade(bars, t, entry_cost, exit_cost) -> dict:
             "gross": result["gross"], "net": result["net"]}
 
 
+def news_at(news_cfg: dict, market: str, symbol: str, window: list, snapshot_as_of: str) -> tuple:
+    """(news object or None, reason) for the decision bar window[-1], under the LIVE freshness rule with the
+    decision time as `now`. The object is anonymised like the snapshot (symbol label, same date shift)."""
+    try:
+        obj, _ = nw.evidence_object(
+            news_cfg["archive"], market=market, candidates=[(symbol, ANON_SYMBOL[market])],
+            sources=news_cfg["sources"], as_of=window[-1]["at"], as_of_text=snapshot_as_of,
+            max_age_s=news_cfg["max_status_age_seconds"], lookback_s=news_cfg["lookback_hours"] * 3600,
+            max_items_per_symbol=news_cfg["max_items_per_symbol"], shift=anon_shift(window))
+        return obj, None
+    except nw.NewsError as exc:
+        return None, str(exc).split(":", 2)[-1][:80]
+
+
+def _call(decide, codex, snapshot, forecast, news, state, record, prefix):
+    """One LIVE proposer call; the first error stops every later call. Returns the action (HOLD on error)."""
+    proposal, meta = decide(snapshot, provider="codex_cli", model=codex["model"], timeout=codex["timeout"],
+                            forecast=forecast, **({"news": news} if news is not None else {}))
+    state["calls"] += 1
+    if meta.get("error"):
+        state["errors"] += 1
+        state["stopped"] = "CODEX_ERROR"
+        record[f"{prefix}_error"] = str(meta["error"])[:200]
+        return "HOLD"
+    record[f"{prefix}_forecast_gate"] = meta.get("forecast_gate")
+    return proposal["action"]
+
+
 def evaluate(data: dict, *, train_sessions, test_sessions, spread_bps, costs, codex=None,
-             decide=None) -> dict:
-    """`codex`: None, or {"model", "max_calls", "timeout"}. `decide` defaults to the LIVE live_ai.decide."""
+             decide=None, news_cfg=None) -> dict:
+    """`codex`: None, or {"model", "max_calls", "timeout"}. `decide` defaults to the LIVE live_ai.decide.
+    `news_cfg`: None, or {"archive", "archive_sha256", "sources", "max_status_age_seconds", "lookback_hours",
+    "max_items_per_symbol"}; it never changes the split, schedule, costs or model-only decisions."""
     decide = decide or live_ai.decide
     market, symbol, bars = data["market"], data["symbol"], data["bars"]
     artifact = ts.train(data, train_sessions)          # training sessions only
@@ -108,6 +152,9 @@ def evaluate(data: dict, *, train_sessions, test_sessions, spread_bps, costs, co
     points = schedule(bars, set(test_sessions))
     state = {"calls": 0, "errors": 0, "stopped": None}
     model_trades, window_trades, hybrid_trades, decisions, predicted, realized = [], [], [], [], [], []
+    news_arms = {"model_only": [], "codex_without_news": [], "codex_news_empty": [], "codex_with_news": []}
+    pairwise_actions = {"codex_without_news_to_empty": {}, "codex_empty_to_news": {}}
+    news_windows, uncovered = 0, {}
     for t in points:
         gross = ts.predict(artifact, ts.window_features(bars, t))
         entry = ts.forecast_entry(artifact, symbol, gross, roundtrip_cost)
@@ -120,37 +167,94 @@ def evaluate(data: dict, *, train_sessions, test_sessions, spread_bps, costs, co
         record = {"decision_at": bars[t]["at"].isoformat(), "session": bars[t]["session"],
                   "predicted_gross_bps": entry["predicted_gross_bps"],
                   "predicted_net_bps": entry["predicted_net_bps"], "model_only": model_action}
+        window = bars[t - ts.WINDOW_BARS + 1:t + 1]
+        snapshot = anonymized_snapshot(market, window)
+        news_obj = None
+        if news_cfg is not None:
+            news_obj, reason = news_at(news_cfg, market, symbol, window, snapshot["as_of"])
+            record["news"] = {"covered": news_obj is not None, "items": len(news_obj["items"]) if news_obj else 0,
+                              "reason": reason}
+            if reason:
+                uncovered[reason] = uncovered.get(reason, 0) + 1
         if codex is not None and state["stopped"] is None:
-            hybrid_action = "HOLD"
-            if model_action == "BUY" and state["calls"] >= codex["max_calls"]:
+            hybrid_action, empty_news_action, news_action = "HOLD", "HOLD", "HOLD"
+            needed = (1 + (2 if news_obj is not None else 0)) if model_action == "BUY" else 0
+            if needed and state["calls"] + needed > codex["max_calls"]:
                 state["stopped"] = "MAX_CODEX_CALLS_REACHED"   # this and later decisions are outside the window
-            elif model_action == "BUY":
-                snapshot = anonymized_snapshot(market, bars[t - ts.WINDOW_BARS + 1:t + 1])
+            elif needed:
                 forecast = ts.forecast_object([ts.forecast_entry(artifact, ANON_SYMBOL[market], gross,
                                                                  roundtrip_cost)])
-                proposal, meta = decide(snapshot, provider="codex_cli", model=codex["model"],
-                                        timeout=codex["timeout"], forecast=forecast)
-                state["calls"] += 1
-                if meta.get("error"):
-                    state["errors"] += 1
-                    state["stopped"] = "CODEX_ERROR"
-                    record["codex_error"] = str(meta["error"])[:200]
-                else:
-                    hybrid_action = proposal["action"]
-                    record["codex_forecast_gate"] = meta.get("forecast_gate")
-            if record.get("codex_error") or state["stopped"] is None:
+                hybrid_action = _call(decide, codex, snapshot, forecast, None, state, record, "codex")
+                if news_obj is not None and state["stopped"] is None:
+                    empty_news = {**news_obj, "items": []}
+                    empty_news_action = _call(decide, codex, snapshot, forecast, empty_news, state, record,
+                                              "codex_news_empty")
+                if news_obj is not None and state["stopped"] is None:
+                    news_action = _call(decide, codex, snapshot, forecast, news_obj, state, record, "codex_news")
+            # A failed/partial call is not an observed HOLD and must not enter a performance comparison. In
+            # particular, do not count a news window unless both Codex arms completed on that same decision.
+            if state["stopped"] is None:
                 record["hybrid"] = hybrid_action
                 if trade:
                     window_trades.append(trade)
                 if hybrid_action == "BUY":
                     hybrid_trades.append(trade)
+                if news_obj is not None:                 # same covered window for all completed arms
+                    news_windows += 1
+                    record["hybrid_with_empty_news"] = empty_news_action
+                    record["hybrid_with_news"] = news_action
+                    for arm, action in (("model_only", model_action), ("codex_without_news", hybrid_action),
+                                        ("codex_news_empty", empty_news_action), ("codex_with_news", news_action)):
+                        if action == "BUY":
+                            news_arms[arm].append(trade)
+                    for pair, first, second in (("codex_without_news_to_empty", hybrid_action, empty_news_action),
+                                                ("codex_empty_to_news", empty_news_action, news_action)):
+                        transition = "UNCHANGED" if first == second else f"{first}_TO_{second}"
+                        pairwise_actions[pair][transition] = pairwise_actions[pair].get(transition, 0) + 1
+            elif trade and any(key in record for key in
+                               ("codex_error", "codex_news_empty_error", "codex_news_error")):
+                # Keep the model-only baseline for the attempted decision, but leave failed Codex arms unscored.
+                window_trades.append(trade)
         decisions.append(record)
+    covered = sum(1 for d in decisions if d.get("news", {}).get("covered"))
     with localcontext() as ctx:
         ctx.prec = 28
         results = {"model_only": he.summarize(model_trades)}
         if codex is not None:
             results["model_only_same_window"] = he.summarize(window_trades)
             results["hybrid"] = he.summarize(hybrid_trades)
+        if codex is not None and news_cfg is not None and news_windows:
+            results["news_window"] = {arm: he.summarize(trades) for arm, trades in news_arms.items()}
+    news_report = None
+    if news_cfg is not None:
+        records = news_cfg["archive"]["records"]
+        news_report = {
+            "archive_sha256": news_cfg["archive_sha256"], "sources": list(news_cfg["sources"]),
+            "max_status_age_seconds": news_cfg["max_status_age_seconds"],
+            "lookback_hours": news_cfg["lookback_hours"], "max_items_per_symbol": news_cfg["max_items_per_symbol"],
+            "archive_records_for_symbol": sum(1 for r in records if (r["market"], r["symbol"]) == (market, symbol)),
+            "earliest_retrieved_at": min((r["retrieved_at"] for r in records
+                                          if (r["market"], r["symbol"]) == (market, symbol)), default=None),
+            "decision_points_covered": covered, "decision_points_uncovered": len(points) - covered,
+            "uncovered_reasons": dict(sorted(uncovered.items())),
+            "coverage_status": ("NO_POINT_IN_TIME_COVERAGE" if covered == 0 else
+                                "FULL" if covered == len(points) else "PARTIAL"),
+            "comparison": ("NOT_RUN_NO_POINT_IN_TIME_COVERAGE" if covered == 0 else
+                           "NOT_RUN_WITHOUT_CODEX" if codex is None else
+                           "NO_COVERED_POINT_IN_CODEX_WINDOW" if not news_windows else "RUN"),
+            "covered_windows_compared": news_windows,
+            "paired_action_transitions": pairwise_actions,
+            "comparison_scope_note": "The empty-news arm holds the NEWS instructions and coverage constant while "
+                                     "removing items; actual and empty inputs are separate single-sample Codex calls. "
+                                     "Differences are diagnostic, not a causal or profitability estimate.",
+            "point_in_time_rule": "record used only if max(available_at, owning run committed_at) <= decision time; "
+                                  "available_at = max(provider time, our retrieved_at), so neither late retrieval nor "
+                                  "archive publication is backfilled; each required source needs an OK run committed by "
+                                  "the decision time within max_status_age_seconds",
+            "model_only_note": "the model-only rule does not read news; Codex calls are restricted to model-only "
+                               "BUY windows with positive predicted net return, so news cannot bypass the forecast "
+                               "gate but may change BUY/HOLD within eligible windows",
+            "anonymization_note": "news titles and summaries are not anonymised and can reveal the issuer and period"}
     return {
         "report_version": REPORT_VERSION, "kind": "OFFLINE_HISTORICAL_HYBRID_TEST", "notice": NOTICE,
         "input": {"market": market, "symbol": symbol, "source": data["source"], "sha256": data["sha256"],
@@ -180,6 +284,7 @@ def evaluate(data: dict, *, train_sessions, test_sessions, spread_bps, costs, co
             "errors": state["errors"], "stopped": state["stopped"],
             "hybrid_complete": state["stopped"] is None, "anonymized_inputs": True,
             "window_note": "model_only_same_window covers exactly the decisions the hybrid arm evaluated"},
+        "news": news_report,
         "decision_points": len(points),
         "results": results,
         "decisions": decisions,
@@ -203,6 +308,12 @@ def main(argv=None) -> int:
     parser.add_argument("--model", default=None, help="exact Codex model ID; without it no Codex call is made")
     parser.add_argument("--max-codex-calls", type=int, default=None, help=f"required with --model (1..{MAX_CODEX_CALLS})")
     parser.add_argument("--timeout-seconds", type=int, default=180, help="per Codex call (30..600)")
+    parser.add_argument("--news-archive", default=None, help="news_collect archive (point-in-time filtered)")
+    parser.add_argument("--news-sources", default=None,
+                        help="comma list, default all sources of the market (KR gdelt,opendart; US gdelt,sec_edgar)")
+    parser.add_argument("--news-max-age-seconds", type=int, default=900, help="collector freshness (60..3600)")
+    parser.add_argument("--news-lookback-hours", type=int, default=24, help="item window (1..168)")
+    parser.add_argument("--news-max-items", type=int, default=5, help="items per decision (1..5)")
     args = parser.parse_args(argv)
     try:
         ts.check_private_output(args.output)
@@ -230,8 +341,25 @@ def main(argv=None) -> int:
         spread, costs = he.resolve_costs(data["market"], spread_raw, overrides)
         train_sessions, test_sessions = split(data["bars"], holdout_sessions=args.holdout_sessions,
                                               train_end_session=args.train_end_session)
+        news_cfg = None
+        if args.news_archive is not None:
+            sources = (args.news_sources.split(",") if args.news_sources else list(nw.MARKET_SOURCES[data["market"]]))
+            if not sources or len(set(sources)) != len(sources) \
+                    or not set(sources) <= set(nw.MARKET_SOURCES[data["market"]]):
+                raise he.InputError(f"--news-sources must be from {nw.MARKET_SOURCES[data['market']]}")
+            nw.validate_config({"archive_path": str(Path(args.news_archive).resolve()),
+                                "max_status_age_seconds": args.news_max_age_seconds,
+                                "lookback_hours": args.news_lookback_hours,
+                                "max_items_per_symbol": args.news_max_items,
+                                "required_sources": {data["market"]: sources}}, {data["market"]: [data["symbol"]]})
+            archive, archive_sha = nw.read_archive(args.news_archive)
+            news_cfg = {"archive": archive, "archive_sha256": archive_sha, "sources": sources,
+                        "max_status_age_seconds": args.news_max_age_seconds,
+                        "lookback_hours": args.news_lookback_hours, "max_items_per_symbol": args.news_max_items}
+        elif args.news_sources is not None:
+            raise he.InputError("--news-sources needs --news-archive")
         report = evaluate(data, train_sessions=train_sessions, test_sessions=test_sessions, spread_bps=spread,
-                          costs=costs, codex=codex)
+                          costs=costs, codex=codex, news_cfg=news_cfg)
     except (ValidationError, OSError, UnicodeDecodeError) as exc:
         print(f"hybrid_eval: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
@@ -239,10 +367,16 @@ def main(argv=None) -> int:
     print(f"{report['kind']} {report['input']['market']} {report['input']['symbol']}: train "
           f"{report['split']['train_sessions']} sessions, test {len(report['split']['test_sessions'])} sessions, "
           f"{report['decision_points']} decision points")
-    for name, m in report["results"].items():
+    flat = {**{k: v for k, v in report["results"].items() if k != "news_window"},
+            **{f"news_window.{k}": v for k, v in report["results"].get("news_window", {}).items()}}
+    for name, m in flat.items():
         print(f"  {name}: trades {m['trades']}, net win rate {m['net_win_rate']}, mean net {m['mean_net_bps']} bps, "
               f"hypothetical compounded {m['compounded_return_pct']}%, max DD {m['max_drawdown_pct']}%"
               + ("" if m["minimum_historical_sample_gate_passed"] else " [SMALL SAMPLE]"))
+    if report["news"] is not None:
+        n = report["news"]
+        print(f"  news: {n['coverage_status']}, covered {n['decision_points_covered']}/{report['decision_points']} "
+              f"decision points, comparison {n['comparison']} ({n['covered_windows_compared']} windows)")
     if report["codex"] is not None:
         c = report["codex"]
         print(f"  codex: {c['calls']} calls, {c['errors']} errors, stopped={c['stopped']}")
